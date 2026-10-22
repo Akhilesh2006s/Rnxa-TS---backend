@@ -73,8 +73,9 @@ authRouter.post("/password", loginLimiter, requireAuth, async (req, res) => {
   res.json({ ok: true });
 });
 
-authRouter.get("/me", requireAuth, (req, res) => {
-  res.json({ user: currentUser(req) });
+/** Who is signed in. Answers { user: null } (not an error) before sign-in, so the page can check quietly. */
+authRouter.get("/me", (req, res) => {
+  res.json({ user: req.user ?? null });
 });
 
 /** Super admin only: view and use the app as another user. Audited on both ends. */
