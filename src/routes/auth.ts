@@ -1,7 +1,7 @@
 import { Router } from "express";
 import rateLimit from "express-rate-limit";
 import { z } from "zod";
-import { clearSessionCookie, currentUser, isSuperAdminAccount, requireAuth, setSessionCookie, verifyPassword } from "../auth.js";
+import { clearSessionCookie, currentUser, hashPassword, isSuperAdminAccount, requireAuth, setSessionCookie, verifyPassword } from "../auth.js";
 import { prisma } from "../db.js";
 import { objectId, type Role } from "../domain.js";
 import { effectivePermissions } from "../services/permissions.js";
@@ -49,6 +49,27 @@ authRouter.post("/login", loginLimiter, async (req, res) => {
 
 authRouter.post("/logout", (_req, res) => {
   clearSessionCookie(res);
+  res.json({ ok: true });
+});
+
+const passwordChangeSchema = z
+  .object({
+    currentPassword: z.string().min(1).max(200),
+    newPassword: z.string().min(10, "The new password must be at least 10 characters.").max(200),
+  })
+  .refine((v) => v.newPassword !== v.currentPassword, { message: "Choose a password different from the current one.", path: ["newPassword"] });
+
+/** Signed-in users change their own password; the current one is required. */
+authRouter.post("/password", loginLimiter, requireAuth, async (req, res) => {
+  const user = currentUser(req);
+  if (user.impersonator) throw forbidden("Return to your own view to change your password.");
+  const { currentPassword, newPassword } = passwordChangeSchema.parse(req.body);
+  const row = await prisma.user.findUnique({ where: { id: user.id } });
+  if (!row || !(await verifyPassword(currentPassword, row.passwordHash))) {
+    throw new HttpError(400, "WRONG_PASSWORD", "Your current password is incorrect.");
+  }
+  await prisma.user.update({ where: { id: user.id }, data: { passwordHash: await hashPassword(newPassword) } });
+  await recordAudit({ actorId: user.id, action: "PASSWORD_CHANGE", entityType: "User", entityId: user.id });
   res.json({ ok: true });
 });
 

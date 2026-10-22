@@ -1,7 +1,8 @@
+import request from "supertest";
 import { beforeAll, describe, expect, it } from "vitest";
 import { prisma } from "../src/db.js";
 import { addDays, today, weekStart } from "../src/services/dates.js";
-import { assign, makeProject, makeUser, setPolicy, signIn, superAdmin, thisWeek } from "./helpers.js";
+import { PASSWORD, app, assign, makeProject, makeUser, setPolicy, signIn, superAdmin, thisWeek } from "./helpers.js";
 
 type U = Awaited<ReturnType<typeof makeUser>>;
 
@@ -168,5 +169,20 @@ describe("alerts", () => {
     expect(res.body.alert.audience).toBe("All managers");
     expect(await prisma.notification.count({ where: { alertId: res.body.alert.id, userId: lead.id } })).toBe(1);
     expect(await prisma.notification.count({ where: { alertId: res.body.alert.id, userId: mine.id } })).toBe(0);
+  });
+});
+
+describe("change password", () => {
+  it("needs the current password, then only the new one works", async () => {
+    const user = await makeUser("EMPLOYEE", "Pw Changer");
+    const api = await signIn(user.email);
+    expect((await api.post("/api/auth/password").send({ currentPassword: "wrong-one-123", newPassword: "brand-new-pass-1" })).status).toBe(400);
+    expect((await api.post("/api/auth/password").send({ currentPassword: PASSWORD, newPassword: "short" })).status).toBe(400);
+    expect((await api.post("/api/auth/password").send({ currentPassword: PASSWORD, newPassword: "brand-new-pass-1" })).status).toBe(200);
+    const fresh = request.agent(app);
+    const old = await fresh.post("/api/auth/login").set("X-Requested-With", "rnxa-web").send({ email: user.email, password: PASSWORD });
+    expect(old.status).toBe(401);
+    const ok = await fresh.post("/api/auth/login").set("X-Requested-With", "rnxa-web").send({ email: user.email, password: "brand-new-pass-1" });
+    expect(ok.status).toBe(200);
   });
 });
