@@ -1,0 +1,307 @@
+// RNXA Timesheet data model, stored in MongoDB Atlas (database "rnxats").
+// Each model is a collection. Apply schema changes with `npm run db:push`.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mongodb"
+  url      = env("DATABASE_URL")
+}
+
+// Role is stored as a string to keep the data model portable.
+// Allowed values: ADMIN | MANAGER | EMPLOYEE (validated in src/domain.ts).
+model User {
+  id           String   @id @default(auto()) @map("_id") @db.ObjectId
+  email        String   @unique
+  name         String
+  passwordHash String
+  role         String   @default("EMPLOYEE")
+  active       Boolean  @default(true)
+  // The manager or admin who verifies this person's time. Admins can verify anyone.
+  verifierId   String?  @db.ObjectId
+  // Extra permissions granted to this person by the super admin (comma-separated).
+  permissions  String   @default("")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  assignments ProjectAssignment[]
+  entries     TimesheetEntry[]    @relation("EntryOwner")
+  reviewed    TimesheetEntry[]    @relation("EntryReviewer")
+  actions     ApprovalAction[]
+  auditEvents AuditEvent[]
+  verifier    User?               @relation("Verifier", fields: [verifierId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  verifies    User[]              @relation("Verifier")
+  leaves      LeaveRequest[]      @relation("LeaveOwner")
+  leaveDecisions LeaveRequest[]   @relation("LeaveApprover")
+  alertsSent  Alert[]             @relation("AlertSender")
+}
+
+model Project {
+  id            String   @id @default(auto()) @map("_id") @db.ObjectId
+  code          String   @unique
+  name          String
+  client        String?
+  description   String?
+  startDate     String? // YYYY-MM-DD
+  endDate       String? // YYYY-MM-DD
+  phasesEnabled Boolean  @default(true)
+  active        Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  phases      Phase[]
+  assignments ProjectAssignment[]
+  entries     TimesheetEntry[]
+}
+
+model Phase {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  projectId String @db.ObjectId
+  name      String
+  description String?
+  startDate String? // YYYY-MM-DD
+  endDate   String? // YYYY-MM-DD
+  // PLANNED | IN_PROGRESS | DONE. Informational; `active` decides whether time can be logged.
+  status    String   @default("IN_PROGRESS")
+  sortOrder Int      @default(0)
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  project Project          @relation(fields: [projectId], references: [id])
+  entries TimesheetEntry[]
+
+  @@unique([projectId, name])
+}
+
+// Links a user to a project they can log time on (role MEMBER).
+// REVIEWER is a legacy value; verification now follows User.verifierId.
+model ProjectAssignment {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId    String @db.ObjectId
+  projectId String @db.ObjectId
+  role      String   @default("MEMBER")
+  createdAt DateTime @default(now())
+
+  user    User    @relation(fields: [userId], references: [id])
+  project Project @relation(fields: [projectId], references: [id])
+
+  @@unique([userId, projectId, role])
+}
+
+// Status: DRAFT | SUBMITTED | CHANGES_REQUESTED | APPROVED | REJECTED
+model TimesheetEntry {
+  id              String    @id @default(auto()) @map("_id") @db.ObjectId
+  userId          String @db.ObjectId
+  projectId       String @db.ObjectId
+  phaseId         String? @db.ObjectId
+  workDate        String // YYYY-MM-DD, calendar date with no time zone
+  // Optional time slot ("HH:MM", local). When set, minutes = endTime - startTime.
+  startTime       String?
+  endTime         String?
+  minutes         Int
+  description     String    @default("")
+  status          String    @default("DRAFT")
+  reviewerComment String?
+  reviewedById    String? @db.ObjectId
+  reviewedAt      DateTime?
+  // True when the entry matched the organisation's auto-verify rules on submit.
+  autoVerified    Boolean   @default(false)
+  submittedAt     DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  user     User             @relation("EntryOwner", fields: [userId], references: [id])
+  reviewer User?            @relation("EntryReviewer", fields: [reviewedById], references: [id])
+  project  Project          @relation(fields: [projectId], references: [id])
+  phase    Phase?           @relation(fields: [phaseId], references: [id])
+  actions     ApprovalAction[]
+  attachments Attachment[]
+
+  @@index([userId, workDate])
+  @@index([userId, status])
+  @@index([projectId, status])
+}
+
+// A photo, video or document attached to a time entry as evidence of the work.
+// The file itself lives in UPLOAD_DIR under storageKey.
+model Attachment {
+  id         String   @id @default(auto()) @map("_id") @db.ObjectId
+  entryId    String   @db.ObjectId
+  uploaderId String   @db.ObjectId
+  fileName   String
+  mimeType   String
+  kind       String // IMAGE | VIDEO | DOCUMENT
+  size       Int
+  storageKey String   @unique
+  createdAt  DateTime @default(now())
+
+  entry TimesheetEntry @relation(fields: [entryId], references: [id])
+
+  @@index([entryId])
+}
+
+// One row per workflow transition on an entry (submit, recall, approve, ...).
+model ApprovalAction {
+  id         String   @id @default(auto()) @map("_id") @db.ObjectId
+  entryId    String @db.ObjectId
+  actorId    String @db.ObjectId
+  action     String
+  fromStatus String
+  toStatus   String
+  comment    String?
+  createdAt  DateTime @default(now())
+
+  entry TimesheetEntry @relation(fields: [entryId], references: [id])
+  actor User           @relation(fields: [actorId], references: [id])
+
+  @@index([entryId])
+}
+
+model AuditEvent {
+  id         String   @id @default(auto()) @map("_id") @db.ObjectId
+  actorId    String? @db.ObjectId
+  action     String
+  entityType String
+  entityId   String
+  changes    String? // JSON of relevant changed fields; never holds secrets
+  createdAt  DateTime @default(now())
+
+  actor User? @relation(fields: [actorId], references: [id])
+
+  @@index([entityType, entityId])
+  @@index([createdAt])
+}
+
+// Single-row organisation policy (id = "org").
+model OrgPolicy {
+  id                   String   @id @default("org") @map("_id")
+  expectedDailyMinutes Int      @default(480)
+  workDays             String   @default("1,2,3,4,5") // ISO weekday numbers, Monday = 1
+  maxPastDays          Int      @default(31)
+  maxFutureDays        Int      @default(0)
+  longEntryMinutes     Int      @default(600)
+  autoReminders        Boolean  @default(true) // automatic in-app reminders for missing time
+  autoVerify           Boolean  @default(true) // verify routine entries automatically on submit
+  autoVerifyMaxDailyMinutes Int @default(480) // a day above this goes to the verifier
+  reminderHour         Int      @default(17) // local hour after which "missing today" reminders go out
+  // Paid leave allowance per person per calendar year, in working days.
+  casualLeaveDays      Int      @default(12)
+  sickLeaveDays        Int      @default(12)
+  earnedLeaveDays      Int      @default(15)
+  updatedAt            DateTime @updatedAt
+}
+
+// Operational metrics for AI features (kind: "rewrite" | "assistant").
+// Never stores prompt or response text.
+model RewriteMetric {
+  id           String   @id @default(auto()) @map("_id") @db.ObjectId
+  kind         String   @default("rewrite")
+  userId       String @db.ObjectId
+  success      Boolean
+  errorCode    String?
+  latencyMs    Int
+  inputTokens  Int      @default(0)
+  outputTokens Int      @default(0)
+  createdAt    DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([userId, createdAt])
+  @@index([kind, userId, createdAt])
+}
+
+// In-app notifications, e.g. reminders to log or submit time.
+// dedupeKey prevents the same automatic reminder being sent twice.
+model Notification {
+  id          String    @id @default(auto()) @map("_id") @db.ObjectId
+  userId      String    @db.ObjectId
+  kind        String // REMINDER | INFO | ALERT
+  title       String
+  body        String
+  link        String?
+  createdById String?   @db.ObjectId
+  dedupeKey   String?
+  // Set for notifications delivered as part of an alert (kind ALERT).
+  alertId     String?   @db.ObjectId
+  readAt      DateTime?
+  createdAt   DateTime  @default(now())
+
+  @@index([userId, readAt, createdAt])
+  @@index([dedupeKey])
+  @@index([alertId])
+}
+
+// A leave request. `days` is the number of working days it covers
+// (weekends and holidays excluded; 0.5 for a half day).
+model LeaveRequest {
+  id              String    @id @default(auto()) @map("_id") @db.ObjectId
+  userId          String    @db.ObjectId
+  type            String // CASUAL | SICK | EARNED | UNPAID
+  startDate       String // YYYY-MM-DD
+  endDate         String // YYYY-MM-DD
+  halfDay         Boolean   @default(false)
+  days            Float
+  reason          String    @default("")
+  status          String    @default("PENDING") // PENDING | APPROVED | REJECTED | CANCELLED
+  approverId      String?   @db.ObjectId
+  decidedAt       DateTime?
+  decisionComment String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  user     User  @relation("LeaveOwner", fields: [userId], references: [id])
+  approver User? @relation("LeaveApprover", fields: [approverId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@index([userId, startDate])
+  @@index([status])
+}
+
+// Organisation-wide holidays: nobody is expected to log time on them.
+model Holiday {
+  id   String @id @default(auto()) @map("_id") @db.ObjectId
+  date String @unique // YYYY-MM-DD
+  name String
+}
+
+// A message sent down the hierarchy: the super admin or an admin to anyone,
+// a manager to the people they verify. Each recipient gets a notification
+// (kind ALERT) whose readAt doubles as the read receipt.
+model Alert {
+  id             String   @id @default(auto()) @map("_id") @db.ObjectId
+  senderId       String   @db.ObjectId
+  title          String
+  body           String
+  priority       String   @default("NORMAL") // NORMAL | URGENT
+  audience       String // human-readable, e.g. "Everyone" or "My team"
+  recipientCount Int
+  createdAt      DateTime @default(now())
+
+  sender User @relation("AlertSender", fields: [senderId], references: [id])
+
+  @@index([senderId, createdAt])
+}
+
+// AI assistant conversation. `messages` holds the exact Claude message history
+// (JSON) so it can be replayed append-only; `pending` holds tool calls that are
+// waiting for the user to approve or decline.
+model AssistantConversation {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId    String   @db.ObjectId // the user the assistant acts as
+  actorId   String?  @db.ObjectId // the real person talking (differs while the super admin views as someone)
+  messages  String   @default("[]")
+  ui        String   @default("[]") // display transcript: user/assistant text and action cards
+  pending   String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId, actorId, updatedAt])
+}
+
+// Permissions for each role, set by the super admin (comma-separated).
+// When a role has no row, the defaults in src/domain.ts apply.
+model RolePermissions {
+  role        String   @id @map("_id")
+  permissions String   @default("")
+  updatedAt   DateTime @updatedAt
+}
